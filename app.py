@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import re
+import unicodedata
 import requests
 from datetime import datetime, timezone
 
@@ -121,6 +123,7 @@ def get_event_anytime_odds(api_key: str, games: list, region: str, stats: pd.Dat
     latest = frame.sort_values(["season", "week"]).drop_duplicates("player", keep="last")
     team_by_player = dict(zip(latest["player"].map(normalize_player_name), latest["team"]))
     rows, remaining = [], "unknown"
+    diagnostics = {"yes_prices": 0, "unknown_player": 0, "wrong_team": 0, "matched": 0, "games_with_market": 0}
     for game in games:
         data, remaining = odds_api_get(
             "/events/" + str(game["id"]) + "/odds", api_key,
@@ -129,21 +132,35 @@ def get_event_anytime_odds(api_key: str, games: list, region: str, stats: pd.Dat
         home, away = NFL_TEAMS.get(game.get("home_team")), NFL_TEAMS.get(game.get("away_team"))
         if not home or not away:
             continue
+        found_market = False
         for book in data.get("bookmakers", []):
             for market in book.get("markets", []):
                 if market.get("key") != "player_anytime_td":
                     continue
+                found_market = True
                 for outcome in market.get("outcomes", []):
-                    # This market can contain Yes/No outcomes. Never use No prices as Yes.
-                    if str(outcome.get("name", "")).strip().lower() not in ("yes",):
-                        continue
-                    player = str(outcome.get("description", "")).strip()
-                    team = team_by_player.get(normalize_player_name(player))
-                    if not player or team not in (home, away):
-                        continue
+                    # Provider schemas can put the player in description with name=Yes,
+                    # or put the player in name with description=Yes.
+                    name = str(outcome.get("name") or "").strip()
+                    description = str(outcome.get("description") or "").strip()
+                    if name.lower() == "yes":
+                        player = description
+                    elif description.lower() == "yes":
+                        player = name
+                    else:
+                        continue  # Never interpret No or other outcomes as Yes.
                     price = outcome.get("price")
-                    if not isinstance(price, (int, float)) or price <= 1:
+                    if not player or not isinstance(price, (int, float)) or price <= 1:
                         continue
+                    diagnostics["yes_prices"] += 1
+                    team = team_by_player.get(normalize_player_name(player))
+                    if team is None:
+                        diagnostics["unknown_player"] += 1
+                        continue
+                    if team not in (home, away):
+                        diagnostics["wrong_team"] += 1
+                        continue
+                    diagnostics["matched"] += 1
                     rows.append({
                         "game_date": str(game["commence_time"])[:10],
                         "game_id": game["id"], "player": player, "team": team,
@@ -154,7 +171,11 @@ def get_event_anytime_odds(api_key: str, games: list, region: str, stats: pd.Dat
                         "matchup": f'{game.get("away_team")} @ {game.get("home_team")}',
                         "commence_time": game["commence_time"],
                     })
-    return clean_odds(pd.DataFrame(rows)), remaining
+        if found_market:
+            diagnostics["games_with_market"] += 1
+    result = clean_odds(pd.DataFrame(rows)) if rows else clean_odds(pd.DataFrame(columns=ODDS_COLUMNS))
+    result.attrs["diagnostics"] = diagnostics
+    return result, remaining
 
 
 def best_event_prices(odds: pd.DataFrame):
@@ -374,7 +395,13 @@ MODEL_FEATURES = [
 
 
 def normalize_player_name(value) -> str:
-    return " ".join(str(value).strip().lower().split())
+    """Normalise punctuation, accents and common suffix differences without fuzzy guesses."""
+    value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
+    value = re.sub(r"[^a-z0-9 ]", " ", value.lower())
+    words = value.split()
+    while words and words[-1] in ("jr", "sr", "ii", "iii", "iv", "v"):
+        words.pop()
+    return " ".join(words)
 
 
 def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[pd.DataFrame, int]:
@@ -491,6 +518,7 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
             out.loc[matched_index, "model_defense_history_available"] = matched_keys.map(lookup["opponent_prior_td_allowed_avg4"]).notna().to_numpy()
             out.loc[matched_index, "player_historical_td_rate_pct"] = matched_keys.map(lookup["player_historical_td_rate_pct"]).to_numpy()
 
+    out["model_fair_odds"] = (1 / out["model_probability"].where(out["model_probability"] > 0)).round(2)
     out["model_probability_pct"] = (100 * out["model_probability"]).round(2)
     out["edge_percentage_points"] = (100 * out["model_probability"] - 100 / out["decimal_odds"]).round(2)
     out["expected_roi_pct"] = (100 * (out["model_probability"] * out["decimal_odds"] - 1)).round(2)
@@ -766,6 +794,7 @@ with upcoming_tab:
                 try:
                     with st.spinner("Fetching player odds and fitting date-restricted model…"):
                         live, remaining = get_event_anytime_odds(entered_key, games[:int(max_games)], region, st.session_state.stats_df)
+                        st.session_state.live_match_diagnostics = live.attrs.get("diagnostics", {})
                         best = best_event_prices(live)
                         if best.empty:
                             st.session_state.live_estimates = pd.DataFrame()
@@ -779,10 +808,14 @@ with upcoming_tab:
         if "live_estimates" in st.session_state:
             estimates = st.session_state.live_estimates
             st.caption(f'Last refreshed (UTC): {st.session_state.get("live_fetch_time", "unknown")}. Prices may have changed.')
-            edge_cutoff = st.slider("Minimum model edge (percentage points)", 0.0, 25.0, 5.0, 0.5, key="upcoming_edge")
-            min_games = st.number_input("Minimum player games of history", 1, 16, 4, key="upcoming_history")
+            diag = st.session_state.get("live_match_diagnostics", {})
+            if diag:
+                st.caption(f'Provider YES quotes: {diag.get("yes_prices", 0):,} · Matched quotes: {diag.get("matched", 0):,} · Unknown names: {diag.get("unknown_player", 0):,} · Team mismatches: {diag.get("wrong_team", 0):,} · Games with this market: {diag.get("games_with_market", 0):,}')
+            edge_cutoff = st.slider("Minimum model edge for top picks (percentage points)", 0.0, 25.0, 5.0, 0.5, key="upcoming_edge")
+            min_games = st.number_input("Minimum player games for top picks", 1, 16, 4, key="upcoming_history")
+            require_defense = st.checkbox("Require opponent defensive history for top picks", value=True, key="upcoming_defense")
             if estimates.empty:
-                st.warning("No matching anytime-TD YES prices were returned. The market may not be listed yet for this region or these games.")
+                st.warning("No matched anytime-TD YES prices. Try another bookmaker region, check market availability, or review the matching diagnostics above.")
             else:
                 for g in games[:int(max_games)]:
                     local = pd.to_datetime(g["commence_time"], utc=True).tz_convert("Australia/Melbourne")
@@ -791,19 +824,32 @@ with upcoming_tab:
                     if group.empty:
                         st.info("No matched anytime-TD prices for this game.")
                         continue
+                    group["status"] = np.select(
+                        [group["model_probability"].isna(),
+                         group["model_prior_games"].lt(min_games),
+                         group["model_defense_history_available"].ne(True),
+                         group["edge_percentage_points"].lt(edge_cutoff)],
+                        ["No model estimate", "Limited player history", "Defence data missing", "Below edge threshold"],
+                        default="Meets thresholds",
+                    )
+                    display = ["player", "model_position_group", "bookmaker", "decimal_odds", "model_fair_odds", "model_probability_pct", "raw_implied_probability_pct", "edge_percentage_points", "expected_roi_pct", "model_prior_games", "status"]
+                    labels = {"model_position_group": "position", "decimal_odds": "bookmaker_odds", "model_fair_odds": "model_fair_odds", "model_probability_pct": "model_td_%", "raw_implied_probability_pct": "book_implied_%", "edge_percentage_points": "edge_pp", "expected_roi_pct": "estimated_ev_%", "model_prior_games": "prior_games"}
+                    with st.expander(f"All {len(group)} matched players — bookmaker vs model odds", expanded=True):
+                        st.dataframe(group.sort_values("expected_roi_pct", ascending=False, na_position="last")[display].rename(columns=labels), hide_index=True, use_container_width=True)
                     eligible = group[
                         group["model_probability"].notna()
                         & group["model_position_group"].isin(ELIGIBLE_POSITIONS)
                         & group["model_prior_games"].ge(min_games)
                         & group["edge_percentage_points"].ge(edge_cutoff)
-                        & group["model_defense_history_available"].eq(True)
+                        & (~require_defense | group["model_defense_history_available"].eq(True))
                     ].sort_values("expected_roi_pct", ascending=False).head(3)
+                    st.markdown("**Top 3 qualifying estimated-EV selections**")
                     if eligible.empty:
-                        st.info("No selections meet the model-history and edge thresholds. No picks forced.")
+                        st.info("No selections meet the current thresholds. The full comparison remains visible above; try relaxing filters for research.")
                     else:
-                        columns = ["player", "model_position_group", "bookmaker", "decimal_odds", "model_probability_pct", "raw_implied_probability_pct", "edge_percentage_points", "expected_roi_pct"]
-                        st.dataframe(eligible[columns].rename(columns={"model_position_group":"position", "decimal_odds":"best_odds"}), hide_index=True, use_container_width=True)
-                st.download_button("Download live EV estimates", estimates.to_csv(index=False), "td_edge_live_ev.csv", "text/csv")
+                        st.dataframe(eligible[display[:-2]].rename(columns=labels), hide_index=True, use_container_width=True)
+                st.caption("Model fair odds = 1 / estimated TD probability. These are experimental estimates, not bookmaker quotes or proven value.")
+                st.download_button("Download all live EV comparisons", estimates.to_csv(index=False), "td_edge_live_ev.csv", "text/csv")
     else:
         st.info("Enter your API key and load upcoming NFL games to begin.")
 
