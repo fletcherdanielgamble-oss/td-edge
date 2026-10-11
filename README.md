@@ -1,10 +1,10 @@
 # TD Edge — NFL Touchdown Value Analysis
 
-A free starter dashboard for NFL touchdown market research. It downloads historical NFL player statistics through `nflreadpy`, accepts bookmaker odds via CSV/Excel, and provides an initial time-based anytime-touchdown model test.
+A free starter dashboard for NFL touchdown market research. It downloads historical NFL player statistics through `nflreadpy`, accepts bookmaker odds via CSV/Excel, provides an initial time-based anytime-touchdown model test, compares best bookmaker prices, and offers experimental anytime-TD probability/expected-value estimates.
 
 ## Important status note
 
-This is a research prototype, not a live odds service and not a proven profitable betting model. The first version does not automatically ingest sportsbook odds, extract screenshots, identify individual coverage matchups, or produce validated first-touchdown / multi-touchdown probabilities. Those are later phases.
+This is a research prototype, not a live odds service and not a proven profitable betting model. The app does not automatically ingest sportsbook odds or extract screenshots, and it does not produce first-touchdown / multi-touchdown probabilities. The anytime-TD probability and expected-value tool is experimental, not calibrated or proven profitable. It restricts training and player history to games dated before each odds event to reduce future-data leakage.
 
 ## Run locally
 
@@ -38,7 +38,7 @@ Use consistent player names and market labels across bookmakers. Example market 
 
 The initial anytime-TD baseline uses lagged player-game opportunity features and a season-based holdout. It deliberately excludes same-game outcomes from its predictors. Brier score is compared with a simple baseline. This is only an initial sanity check; before any betting use, add calibration plots, log loss, rolling-origin validation across several seasons, timestamped historical odds, realistic price/market matching, and uncertainty estimates.
 
-The first-TD and 2+ TD markets are listed in the odds template but are not yet predicted by the model. First touchdown requires modelling scoring order and team/game scoring conditions; multi-TD requires a distinct count/probability model.
+The first-TD, 2+ TD, rushing-TD and receiving-TD markets are listed in the odds template but are not yet predicted by this model. First touchdown requires modelling scoring order and team/game scoring conditions; multi-TD requires a distinct count/probability model.
 
 ## Free deployment
 

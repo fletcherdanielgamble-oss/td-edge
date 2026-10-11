@@ -147,13 +147,112 @@ def train_anytime_model(stats: pd.DataFrame):
     return model, frame, test, brier, base, features
 
 
+
+MODEL_FEATURES = [
+    "prior_carries_avg4", "prior_targets_avg4", "prior_receptions_avg4",
+    "prior_rush_yards_avg4", "prior_rec_yards_avg4", "prior_tds_avg8",
+    "prior_any_td_rate", "prior_games",
+]
+
+
+def normalize_player_name(value) -> str:
+    return " ".join(str(value).strip().lower().split())
+
+
+def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Estimate next-game ATD probabilities using only information before each event date.
+
+    This is an experimental research estimate, not a calibrated betting signal. For
+    each odds event date, both training labels and player usage features are restricted
+    to historical games dated before that event.
+    """
+    from sklearn.impute import SimpleImputer
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+
+    all_frame = build_player_game_features(stats)
+    all_frame["_game_date_dt"] = pd.to_datetime(all_frame["game_date"], errors="coerce")
+    if all_frame["_game_date_dt"].notna().sum() < 100:
+        raise ValueError("The historical stats need valid game_date values to prevent using future game results.")
+
+    out = odds.copy()
+    out["player_key"] = out["player"].map(normalize_player_name)
+    out["decimal_odds"] = pd.to_numeric(out["decimal_odds"], errors="coerce")
+    out["raw_implied_probability_pct"] = (100 / out["decimal_odds"]).round(2)
+    out["model_probability"] = np.nan
+    out["model_last_season"] = np.nan
+    out["model_training_rows"] = np.nan
+
+    atd_mask = out["market"].astype(str).str.strip().str.lower().isin(
+        ["anytime td", "anytime touchdown", "anytime touchdown scorer"]
+    )
+    out["_event_date_dt"] = pd.to_datetime(out["game_date"], errors="coerce")
+
+    for event_date in out.loc[atd_mask, "_event_date_dt"].dropna().drop_duplicates():
+        row_mask = atd_mask & (out["_event_date_dt"] == event_date)
+        # Strict cutoff: never train on or use stats from the target game date or later.
+        history = all_frame[all_frame["_game_date_dt"] < event_date].copy()
+        train = history[history["prior_games"] >= 1].copy()
+        if len(train) < 100 or train["target_any_td"].nunique() < 2:
+            continue
+
+        model = Pipeline([
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scale", StandardScaler()),
+            ("logit", LogisticRegression(max_iter=1000, class_weight=None)),
+        ])
+        model.fit(train[MODEL_FEATURES], train["target_any_td"])
+
+        future_rows = []
+        # Use each player's latest eligible season and only games before event_date.
+        for player, player_history in history.groupby("player", sort=False):
+            player_history = player_history.sort_values(["season", "week"])
+            latest_season = player_history["season"].max()
+            season_history = player_history[player_history["season"] == latest_season]
+            if season_history.empty:
+                continue
+            row = {"player_key": normalize_player_name(player), "last_season": int(latest_season)}
+            row["prior_carries_avg4"] = float(season_history["_carries"].tail(4).mean())
+            row["prior_targets_avg4"] = float(season_history["_targets"].tail(4).mean())
+            row["prior_receptions_avg4"] = float(season_history["_receptions"].tail(4).mean())
+            row["prior_rush_yards_avg4"] = float(season_history["_rush_yards"].tail(4).mean())
+            row["prior_rec_yards_avg4"] = float(season_history["_rec_yards"].tail(4).mean())
+            row["prior_tds_avg8"] = float(season_history["_tds"].tail(8).mean())
+            row["prior_any_td_rate"] = float(season_history["target_any_td"].mean())
+            row["prior_games"] = int(len(season_history))
+            future_rows.append(row)
+
+        if not future_rows:
+            continue
+        future = pd.DataFrame(future_rows).drop_duplicates("player_key", keep="last")
+        future["model_probability"] = model.predict_proba(future[MODEL_FEATURES])[:, 1]
+        lookup = future.set_index("player_key")
+        keys = out.loc[row_mask, "player_key"]
+        matched = keys.isin(lookup.index)
+        matched_index = keys.index[matched]
+        if len(matched_index):
+            matched_keys = out.loc[matched_index, "player_key"]
+            out.loc[matched_index, "model_probability"] = matched_keys.map(lookup["model_probability"]).to_numpy()
+            out.loc[matched_index, "model_last_season"] = matched_keys.map(lookup["last_season"]).to_numpy()
+            out.loc[matched_index, "model_training_rows"] = len(train)
+
+    out["model_probability_pct"] = (100 * out["model_probability"]).round(2)
+    out["edge_percentage_points"] = (100 * out["model_probability"] - 100 / out["decimal_odds"]).round(2)
+    out["expected_roi_pct"] = (100 * (out["model_probability"] * out["decimal_odds"] - 1)).round(2)
+    out["expected_profit_per_100"] = (100 * (out["model_probability"] * out["decimal_odds"] - 1)).round(2)
+    latest_season = pd.to_numeric(stats.get("season"), errors="coerce")
+    latest_season = int(latest_season.max()) if latest_season.notna().any() else 0
+    return out.drop(columns=["player_key", "_event_date_dt"]), latest_season
+
+
 st.title("🏈 TD Edge")
 st.caption("NFL touchdown value-analysis · Free starter build · Research mode")
 st.warning("This is an early research prototype, not a live betting feed or a proven profitable model. Predictions are disabled until sufficient historical data is loaded and tested.")
 
 with st.sidebar:
     st.header("Data setup")
-    seasons_text = st.text_input("NFL seasons to download", "2018,2019,2020,2021,2022,2023,2024,2025")
+    seasons_text = st.text_input("NFL seasons to download", "2018,2019,2020,2021,2022,2023,2024,2025,2026")
     load_btn = st.button("Download public NFL player stats", type="primary", use_container_width=True)
     st.caption("Requires internet access in the environment running this app. The initial download can take a little while.")
 
@@ -235,6 +334,33 @@ with odds_tab:
             st.caption("The highest decimal odds in each matching group are shown below. A group with one quote has no competing bookmaker price yet.")
             display_cols = [c for c in ["game_date", "game_id", "player", "team", "opponent", "market", "best_bookmaker", "best_odds", "implied_probability_pct", "bookmakers_compared"] if c in best.columns]
             st.dataframe(best[display_cols], use_container_width=True)
+        st.divider()
+        st.subheader("Experimental anytime-TD probability & expected value")
+        st.caption("This fits a simple logistic model on loaded historical player usage. Estimates are research-only, not calibrated or proven profitable. First-TD, 2+ TD, rushing-TD and receiving-TD probabilities are not calculated by this model.")
+        stats_for_value = st.session_state.stats_df
+        if stats_for_value is None:
+            st.info("Download historical player stats in the sidebar before calculating estimates.")
+        else:
+            loaded_seasons = pd.to_numeric(stats_for_value.get("season"), errors="coerce")
+            latest_loaded_season = int(loaded_seasons.max()) if loaded_seasons is not None and loaded_seasons.notna().any() else None
+            if latest_loaded_season is not None and latest_loaded_season < 2026:
+                st.warning(f"Your loaded data ends in {latest_loaded_season}. For current-season estimates, reload stats including 2026 in the sidebar; older usage may be stale.")
+            if st.button("Estimate anytime-TD probabilities & value", type="primary"):
+                try:
+                    with st.spinner("Fitting the research model and estimating player probabilities…"):
+                        value_rows, latest_stats_season = estimate_anytime_td_value(stats_for_value, odds)
+                    st.session_state.value_rows = value_rows
+                    st.session_state.value_stats_season = latest_stats_season
+                except Exception as exc:
+                    st.error(f"Could not calculate estimates: {exc}")
+            if "value_rows" in st.session_state:
+                value_rows = st.session_state.value_rows
+                if st.session_state.get("value_stats_season", 0) < 2026:
+                    st.warning("These estimates use historical data ending before the 2026 season. Refresh the data before using them for current games.")
+                show_cols = [c for c in ["game_date", "player", "team", "opponent", "market", "bookmaker", "decimal_odds", "raw_implied_probability_pct", "model_probability_pct", "edge_percentage_points", "expected_roi_pct", "model_last_season"] if c in value_rows.columns]
+                st.dataframe(value_rows[show_cols], use_container_width=True)
+                st.caption("Expected ROI = model probability × decimal odds − 1. It is only as trustworthy as the probability estimate; it does not account for model uncertainty or guarantee future returns. A missing model probability means the player name was not matched or the market is not supported.")
+                st.download_button("Download odds with experimental estimates", value_rows.to_csv(index=False).encode(), "td_edge_value_estimates.csv", "text/csv")
         st.download_button("Download cleaned odds", odds.to_csv(index=False).encode(), "td_edge_odds_clean.csv", "text/csv")
         st.caption("Compare only quotes for the same player, market and event. The best price is not necessarily a profitable bet; that requires a reliable probability estimate.")
     else:
