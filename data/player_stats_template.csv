@@ -1,0 +1,2 @@
+player_id,player_name,season,week,team,opponent_team,carries,targets,receptions,rushing_yards,receiving_yards,rushing_tds,receiving_tds
+example_id,Example Player,2025,1,ABC,XYZ,10,4,3,48,22,1,0
