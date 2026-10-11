@@ -211,9 +211,32 @@ with odds_tab:
         view = odds[odds["market"] == selected_market].copy()
         if "player" in view.columns:
             view = view.sort_values("decimal_odds", ascending=False)
+        st.subheader("All imported quotes")
         st.dataframe(view, use_container_width=True)
+
+        # Explicit best-price comparison. Keep event fields in the key so prices
+        # from different games are never compared against one another.
+        best_keys = [c for c in ["game_date", "game_id", "player", "team", "opponent", "market"] if c in view.columns]
+        if "player" in best_keys and "market" in best_keys and not view.empty:
+            comparison = view.copy()
+            comparison["decimal_odds"] = pd.to_numeric(comparison["decimal_odds"], errors="coerce")
+            comparison = comparison.dropna(subset=["decimal_odds"])
+            # Treat blank event identifiers consistently; keep the remaining event
+            # fields in the group key to avoid merging unrelated fixtures.
+            grouped = comparison.groupby(best_keys, dropna=False, sort=False)
+            best_indices = grouped["decimal_odds"].idxmax()
+            best = comparison.loc[best_indices].copy()
+            counts = grouped["decimal_odds"].count().rename("bookmakers_compared").reset_index()
+            best = best.merge(counts, on=best_keys, how="left")
+            best = best.rename(columns={"bookmaker": "best_bookmaker", "decimal_odds": "best_odds"})
+            best["implied_probability_pct"] = (100 / best["best_odds"]).round(2)
+            best = best.sort_values(["player", "best_odds"], ascending=[True, False])
+            st.subheader("Best available price by player, market and event")
+            st.caption("The highest decimal odds in each matching group are shown below. A group with one quote has no competing bookmaker price yet.")
+            display_cols = [c for c in ["game_date", "game_id", "player", "team", "opponent", "market", "best_bookmaker", "best_odds", "implied_probability_pct", "bookmakers_compared"] if c in best.columns]
+            st.dataframe(best[display_cols], use_container_width=True)
         st.download_button("Download cleaned odds", odds.to_csv(index=False).encode(), "td_edge_odds_clean.csv", "text/csv")
-        st.caption("Best odds are compared only for matching player, market and event fields. Ensure market labels and player names are consistent across bookmakers.")
+        st.caption("Compare only quotes for the same player, market and event. The best price is not necessarily a profitable bet; that requires a reliable probability estimate.")
     else:
         st.info("No odds imported yet. Download the blank template below.")
     template = pd.DataFrame([
