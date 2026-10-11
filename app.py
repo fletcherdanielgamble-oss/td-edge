@@ -835,7 +835,15 @@ with upcoming_tab:
                     display = ["player", "model_position_group", "bookmaker", "decimal_odds", "model_fair_odds", "model_probability_pct", "raw_implied_probability_pct", "edge_percentage_points", "expected_roi_pct", "model_prior_games", "status"]
                     labels = {"model_position_group": "position", "decimal_odds": "bookmaker_odds", "model_fair_odds": "model_fair_odds", "model_probability_pct": "model_td_%", "raw_implied_probability_pct": "book_implied_%", "edge_percentage_points": "edge_pp", "expected_roi_pct": "estimated_ev_%", "model_prior_games": "prior_games"}
                     with st.expander(f"All {len(group)} matched players — bookmaker vs model odds", expanded=True):
-                        st.dataframe(group.sort_values("expected_roi_pct", ascending=False, na_position="last")[display].rename(columns=labels), hide_index=True, use_container_width=True)
+                        # Provider responses and older session data may omit optional fields.
+                        # Reindex fills missing columns with NaN rather than crashing the app.
+                        available_sort = [c for c in ["expected_roi_pct", "decimal_odds"] if c in group.columns]
+                        comparison_rows = (group.sort_values(available_sort[0], ascending=False, na_position="last")
+                                           if available_sort else group.copy())
+                        missing_display = [c for c in display if c not in comparison_rows.columns]
+                        if missing_display:
+                            st.caption("Some comparison fields are unavailable for these odds: " + ", ".join(missing_display))
+                        st.dataframe(comparison_rows.reindex(columns=display).rename(columns=labels), hide_index=True, use_container_width=True)
                     eligible = group[
                         group["model_probability"].notna()
                         & group["model_position_group"].isin(ELIGIBLE_POSITIONS)
