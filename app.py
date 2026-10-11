@@ -369,7 +369,7 @@ def validate_position_models(stats: pd.DataFrame):
     ONLY on earlier seasons' genuinely out-of-sample base predictions. The
     earliest test seasons have no prior calibration and are marked as such.
     """
-    from sklearn.impute import SimpleImpute
+    from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
