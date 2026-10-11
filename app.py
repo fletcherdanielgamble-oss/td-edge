@@ -148,6 +148,8 @@ def build_player_game_features(stats: pd.DataFrame) -> pd.DataFrame:
     rush_yards = numeric_col("rushing_yards")
     rec_yards = numeric_col("receiving_yards")
     df["target_any_td"] = ((rush_tds + rec_tds) > 0).astype(int)
+    df["_rush_tds"] = rush_tds
+    df["_rec_tds"] = rec_tds
     df["_carries"] = carries
     df["_targets"] = targets
     df["_receptions"] = receptions
@@ -158,16 +160,19 @@ def build_player_game_features(stats: pd.DataFrame) -> pd.DataFrame:
     group_keys = ["_player_key", "season"]
     feature_specs = [("_carries", "prior_carries_avg4"), ("_targets", "prior_targets_avg4"),
                      ("_receptions", "prior_receptions_avg4"), ("_rush_yards", "prior_rush_yards_avg4"),
-                     ("_rec_yards", "prior_rec_yards_avg4"), ("_tds", "prior_tds_avg8")]
+                     ("_rec_yards", "prior_rec_yards_avg4"), ("_tds", "prior_tds_avg8"),
+                     ("_rush_tds", "prior_rush_tds_avg8"), ("_rec_tds", "prior_rec_tds_avg8")]
     for source, dest in feature_specs:
-        window = 8 if source == "_tds" else 4
+        window = 8 if source in ["_tds", "_rush_tds", "_rec_tds"] else 4
         df[dest] = df.groupby(group_keys)[source].transform(lambda s: s.shift(1).rolling(window, min_periods=1).mean())
     df["prior_games"] = df.groupby(group_keys).cumcount()
     df["prior_any_td_rate"] = df.groupby(group_keys)["target_any_td"].transform(lambda s: s.shift(1).expanding(min_periods=1).mean())
     df["prior_any_td_rate"] = df["prior_any_td_rate"].fillna(df["target_any_td"].mean())
-    for c in ["prior_carries_avg4", "prior_targets_avg4", "prior_receptions_avg4", "prior_rush_yards_avg4", "prior_rec_yards_avg4", "prior_tds_avg8"]:
+    for c in ["prior_carries_avg4", "prior_targets_avg4", "prior_receptions_avg4", "prior_rush_yards_avg4", "prior_rec_yards_avg4", "prior_tds_avg8", "prior_rush_tds_avg8", "prior_rec_tds_avg8"]:
         df[c] = df[c].fillna(0)
     df["player"] = df[find("player_display_name", "player_name", "player_id")].astype(str)
+    position_col = find("position", "position_group", "player_position")
+    df["position"] = df[position_col].astype(str).str.upper().str.strip() if position_col else "UNKNOWN"
     team_col = find("recent_team", "team")
     opp_col = find("opponent_team", "opponent")
     df["team"] = df[team_col].astype(str) if team_col else ""
@@ -204,7 +209,7 @@ def train_anytime_model(stats: pd.DataFrame):
 MODEL_FEATURES = [
     "prior_carries_avg4", "prior_targets_avg4", "prior_receptions_avg4",
     "prior_rush_yards_avg4", "prior_rec_yards_avg4", "prior_tds_avg8",
-    "prior_any_td_rate", "prior_games",
+    "prior_rush_tds_avg8", "prior_rec_tds_avg8", "prior_any_td_rate", "prior_games",
 ]
 
 
@@ -213,12 +218,7 @@ def normalize_player_name(value) -> str:
 
 
 def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Estimate next-game ATD probabilities using only information before each event date.
-
-    This is an experimental research estimate, not a calibrated betting signal. For
-    each odds event date, both training labels and player usage features are restricted
-    to historical games dated before that event.
-    """
+    """Experimental position-aware next-game ATD estimates with strict date cutoffs."""
     from sklearn.impute import SimpleImputer
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
@@ -236,6 +236,7 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
     out["model_probability"] = np.nan
     out["model_last_season"] = np.nan
     out["model_training_rows"] = np.nan
+    out["model_position_group"] = ""
 
     atd_mask = out["market"].astype(str).str.strip().str.lower().isin(
         ["anytime td", "anytime touchdown", "anytime touchdown scorer"]
@@ -244,34 +245,44 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
 
     for event_date in out.loc[atd_mask, "_event_date_dt"].dropna().drop_duplicates():
         row_mask = atd_mask & (out["_event_date_dt"] == event_date)
-        # Strict cutoff: never train on or use stats from the target game date or later.
         history = all_frame[all_frame["_game_date_dt"] < event_date].copy()
         train = history[history["prior_games"] >= 1].copy()
         if len(train) < 100 or train["target_any_td"].nunique() < 2:
             continue
 
-        model = Pipeline([
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scale", StandardScaler()),
-            ("logit", LogisticRegression(max_iter=1000, class_weight=None)),
-        ])
-        model.fit(train[MODEL_FEATURES], train["target_any_td"])
+        def make_model():
+            return Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler()),
+                ("logit", LogisticRegression(max_iter=1000, class_weight=None)),
+            ])
+
+        global_model = make_model()
+        global_model.fit(train[MODEL_FEATURES], train["target_any_td"])
+        position_models = {}
+        for pos, pos_train in train.groupby("position"):
+            if len(pos_train) >= 100 and pos_train["target_any_td"].nunique() >= 2:
+                pos_model = make_model()
+                pos_model.fit(pos_train[MODEL_FEATURES], pos_train["target_any_td"])
+                position_models[pos] = (pos_model, len(pos_train))
 
         future_rows = []
-        # Use each player's latest eligible season and only games before event_date.
         for player, player_history in history.groupby("player", sort=False):
             player_history = player_history.sort_values(["season", "week"])
             latest_season = player_history["season"].max()
             season_history = player_history[player_history["season"] == latest_season]
             if season_history.empty:
                 continue
-            row = {"player_key": normalize_player_name(player), "last_season": int(latest_season)}
+            row = {"player_key": normalize_player_name(player), "last_season": int(latest_season),
+                   "position": str(season_history["position"].iloc[-1]).upper().strip()}
             row["prior_carries_avg4"] = float(season_history["_carries"].tail(4).mean())
             row["prior_targets_avg4"] = float(season_history["_targets"].tail(4).mean())
             row["prior_receptions_avg4"] = float(season_history["_receptions"].tail(4).mean())
             row["prior_rush_yards_avg4"] = float(season_history["_rush_yards"].tail(4).mean())
             row["prior_rec_yards_avg4"] = float(season_history["_rec_yards"].tail(4).mean())
             row["prior_tds_avg8"] = float(season_history["_tds"].tail(8).mean())
+            row["prior_rush_tds_avg8"] = float(season_history["_rush_tds"].tail(8).mean())
+            row["prior_rec_tds_avg8"] = float(season_history["_rec_tds"].tail(8).mean())
             row["prior_any_td_rate"] = float(season_history["target_any_td"].mean())
             row["prior_games"] = int(len(season_history))
             future_rows.append(row)
@@ -279,7 +290,15 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
         if not future_rows:
             continue
         future = pd.DataFrame(future_rows).drop_duplicates("player_key", keep="last")
-        future["model_probability"] = model.predict_proba(future[MODEL_FEATURES])[:, 1]
+        future["model_probability"] = np.nan
+        future["model_training_rows"] = len(train)
+        for pos, idx in future.groupby("position").groups.items():
+            if pos in position_models:
+                chosen_model, n_train = position_models[pos]
+                future.loc[idx, "model_probability"] = chosen_model.predict_proba(future.loc[idx, MODEL_FEATURES])[:, 1]
+                future.loc[idx, "model_training_rows"] = n_train
+            else:
+                future.loc[idx, "model_probability"] = global_model.predict_proba(future.loc[idx, MODEL_FEATURES])[:, 1]
         lookup = future.set_index("player_key")
         keys = out.loc[row_mask, "player_key"]
         matched = keys.isin(lookup.index)
@@ -288,7 +307,8 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
             matched_keys = out.loc[matched_index, "player_key"]
             out.loc[matched_index, "model_probability"] = matched_keys.map(lookup["model_probability"]).to_numpy()
             out.loc[matched_index, "model_last_season"] = matched_keys.map(lookup["last_season"]).to_numpy()
-            out.loc[matched_index, "model_training_rows"] = len(train)
+            out.loc[matched_index, "model_training_rows"] = matched_keys.map(lookup["model_training_rows"]).to_numpy()
+            out.loc[matched_index, "model_position_group"] = matched_keys.map(lookup["position"]).fillna("").to_numpy()
 
     out["model_probability_pct"] = (100 * out["model_probability"]).round(2)
     out["edge_percentage_points"] = (100 * out["model_probability"] - 100 / out["decimal_odds"]).round(2)
@@ -297,7 +317,6 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
     latest_season = pd.to_numeric(stats.get("season"), errors="coerce")
     latest_season = int(latest_season.max()) if latest_season.notna().any() else 0
     return out.drop(columns=["player_key", "_event_date_dt"]), latest_season
-
 
 st.title("🏈 TD Edge")
 st.caption("NFL touchdown value-analysis · Free starter build · Research mode")
