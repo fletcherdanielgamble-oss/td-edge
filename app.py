@@ -10,6 +10,8 @@ import streamlit as st
 st.set_page_config(page_title="TD Edge | NFL Touchdown Analytics", page_icon="🏈", layout="wide")
 
 ODDS_COLUMNS = ["game_date", "season", "week", "game_id", "player", "team", "opponent", "market", "bookmaker", "decimal_odds", "captured_at_utc"]
+ELIGIBLE_POSITIONS = ("QB", "RB", "WR", "TE")
+
 MARKETS = ["Anytime TD", "First TD", "2+ TDs", "Rushing TD", "Receiving TD"]
 
 
@@ -179,7 +181,10 @@ def build_player_game_features(stats: pd.DataFrame) -> pd.DataFrame:
     df["opponent"] = df[opp_col].astype(str) if opp_col else ""
     date_col = find("game_date", "gameday", "game_date_dt")
     df["game_date"] = df[date_col].astype(str) if date_col else ""
-    return df
+    # Restrict the modelling universe, not merely the display. Exclude other
+    # positions before training, calibration, and evaluation.
+    df["position"] = df["position"].replace({"HB": "RB", "FB": "RB"})
+    return df[df["position"].isin(ELIGIBLE_POSITIONS)].copy()
 
 
 def train_anytime_model(stats: pd.DataFrame):
@@ -325,9 +330,46 @@ def estimate_anytime_td_value(stats: pd.DataFrame, odds: pd.DataFrame) -> tuple[
     latest_season = int(latest_season.max()) if latest_season.notna().any() else 0
     return out.drop(columns=["player_key", "_event_date_dt"]), latest_season
 
+def _fit_probability_calibrator(prior_predictions: pd.DataFrame):
+    """Fit Platt calibration exclusively on previously held-out seasons."""
+    from sklearn.linear_model import LogisticRegression
+    if len(prior_predictions) < 300 or prior_predictions["target_any_td"].nunique() < 2:
+        return None
+    probs = np.clip(prior_predictions["raw_probability"].to_numpy(dtype=float), 1e-5, 1 - 1e-5)
+    log_odds = np.log(probs / (1 - probs)).reshape(-1, 1)
+    model = LogisticRegression(max_iter=1000)
+    model.fit(log_odds, prior_predictions["target_any_td"])
+    return model
+
+
+def _apply_calibrator(model, raw_probs):
+    probs = np.clip(np.asarray(raw_probs, dtype=float), 1e-5, 1 - 1e-5)
+    if model is None:
+        return probs
+    return model.predict_proba(np.log(probs / (1 - probs)).reshape(-1, 1))[:, 1]
+
+
+def _calibration_table(preds: pd.DataFrame, probability_column: str, group_columns=None):
+    work = preds.copy()
+    work["probability_band"] = pd.cut(work[probability_column], bins=np.linspace(0, 1, 11), include_lowest=True)
+    groups = (group_columns or []) + ["probability_band"]
+    result = work.groupby(groups, observed=False).agg(
+        n=("target_any_td", "size"),
+        predicted_pct=(probability_column, lambda x: round(100 * x.mean(), 2)),
+        observed_pct=("target_any_td", lambda x: round(100 * x.mean(), 2)),
+    ).reset_index()
+    result["probability_band"] = result["probability_band"].astype(str)
+    return result[result["n"] > 0].reset_index(drop=True)
+
+
 def validate_position_models(stats: pd.DataFrame):
-    """Walk-forward season tests, always training only on earlier seasons."""
-    from sklearn.impute import SimpleImputer
+    """Chronological model and calibration tests on QB/RB/WR/TE only.
+
+    For season S, the base model is fit on seasons < S. Calibration is fitted
+    ONLY on earlier seasons' genuinely out-of-sample base predictions. The
+    earliest test seasons have no prior calibration and are marked as such.
+    """
+    from sklearn.impute import SimpleImpute
     from sklearn.linear_model import LogisticRegression
     from sklearn.pipeline import Pipeline
     from sklearn.preprocessing import StandardScaler
@@ -336,7 +378,7 @@ def validate_position_models(stats: pd.DataFrame):
     frame = build_player_game_features(stats)
     frame = frame[frame["prior_games"] >= 1].copy()
     seasons = sorted(int(x) for x in frame["season"].dropna().unique())
-    reports, predictions = [], []
+    reports, predictions, previous_oos = [], [], []
     for season in seasons[1:]:
         train = frame[frame["season"] < season]
         test = frame[frame["season"] == season].copy()
@@ -350,7 +392,7 @@ def validate_position_models(stats: pd.DataFrame):
             ])
         global_model = make_model()
         global_model.fit(train[MODEL_FEATURES], train["target_any_td"])
-        test["predicted_probability"] = global_model.predict_proba(test[MODEL_FEATURES])[:, 1]
+        test["raw_probability"] = global_model.predict_proba(test[MODEL_FEATURES])[:, 1]
         test["model_type"] = "global_fallback"
         for pos, pos_train in train.groupby("position"):
             idx = test.index[test["position"] == pos]
@@ -358,41 +400,58 @@ def validate_position_models(stats: pd.DataFrame):
                 continue
             model = make_model()
             model.fit(pos_train[MODEL_FEATURES], pos_train["target_any_td"])
-            test.loc[idx, "predicted_probability"] = model.predict_proba(test.loc[idx, MODEL_FEATURES])[:, 1]
+            test.loc[idx, "raw_probability"] = model.predict_proba(test.loc[idx, MODEL_FEATURES])[:, 1]
             test.loc[idx, "model_type"] = "position_specific"
+
+        test["predicted_probability"] = test["raw_probability"]
+        test["calibration_method"] = "uncalibrated_insufficient_prior_oos"
+        if previous_oos:
+            prior = pd.concat(previous_oos, ignore_index=True)
+            pooled = _fit_probability_calibrator(prior)
+            for pos, idx in test.groupby("position").groups.items():
+                pos_prior = prior[prior["position"] == pos]
+                pos_cal = _fit_probability_calibrator(pos_prior)
+                cal = pos_cal if pos_cal is not None else pooled
+                if cal is not None:
+                    test.loc[idx, "predicted_probability"] = _apply_calibrator(cal, test.loc[idx, "raw_probability"])
+                    test.loc[idx, "calibration_method"] = "position_platt" if pos_cal is not None else "pooled_platt"
+
+        # Eligibility depends ONLY on usage prior to this game. These thresholds
+        # are research defaults, not a claim about bookmaker listing policies.
+        test["betting_relevant"] = (
+            (test["prior_games"] >= 2)
+            & ((test["prior_carries_avg4"] >= 3) | (test["prior_targets_avg4"] >= 3))
+        )
+        test["test_season"] = season
         y = test["target_any_td"].to_numpy()
         pred = test["predicted_probability"].to_numpy()
-        baseline = float(train["target_any_td"].mean())  # Never use test outcomes as baseline.
+        raw = test["raw_probability"].to_numpy()
+        baseline = float(train["target_any_td"].mean())
         reports.append({
             "test_season": season, "test_rows": len(test), "train_rows": len(train),
-            "brier": brier_score_loss(y, pred),
+            "brier": brier_score_loss(y, pred), "raw_brier": brier_score_loss(y, raw),
             "baseline_brier": brier_score_loss(y, np.full(len(y), baseline)),
             "log_loss": log_loss(y, pred, labels=[0, 1]),
+            "raw_log_loss": log_loss(y, raw, labels=[0, 1]),
             "baseline_log_loss": log_loss(y, np.full(len(y), baseline), labels=[0, 1]),
             "observed_td_rate_pct": 100 * float(np.mean(y)),
             "mean_prediction_pct": 100 * float(np.mean(pred)),
+            "betting_relevant_rows": int(test["betting_relevant"].sum()),
+            "calibrated_rows": int((test["calibration_method"] != "uncalibrated_insufficient_prior_oos").sum()),
             "position_model_pct": 100 * float((test["model_type"] == "position_specific").mean()),
         })
-        predictions.append(test[["season", "position", "target_any_td", "predicted_probability", "model_type"]].copy())
+        previous_oos.append(test[["position", "target_any_td", "raw_probability"]].copy())
+        predictions.append(test[["season", "position", "target_any_td", "raw_probability", "predicted_probability", "model_type", "calibration_method", "betting_relevant", "prior_games", "prior_carries_avg4", "prior_targets_avg4"]].copy())
     if not reports:
-        raise ValueError("Need several seasons of player stats for chronological validation. Download 2018–2026.")
+        raise ValueError("Need multiple NFL seasons with enough QB/RB/WR/TE data (ideally 2018–2026).")
     report = pd.DataFrame(reports)
     preds = pd.concat(predictions, ignore_index=True)
-    # Fixed-width probability bands make reliability easier to inspect.
-    preds["probability_band"] = pd.cut(preds["predicted_probability"], bins=np.linspace(0, 1, 11), include_lowest=True)
-    calibration = preds.groupby("probability_band", observed=False).agg(
-        n=("target_any_td", "size"),
-        mean_prediction=("predicted_probability", "mean"),
-        actual_td_rate=("target_any_td", "mean"),
-    ).reset_index()
-    calibration["probability_band"] = calibration["probability_band"].astype(str)
-    calibration["predicted_pct"] = (100 * calibration["mean_prediction"]).round(2)
-    calibration["observed_pct"] = (100 * calibration["actual_td_rate"]).round(2)
-    return report, calibration[["probability_band", "n", "predicted_pct", "observed_pct"]], preds
+    calibration = _calibration_table(preds, "predicted_probability")
+    return report, calibration, preds
 
 
 st.title("🏈 TD Edge")
-st.caption("NFL touchdown value-analysis · Free starter build · Research mode")
+st.caption("NFL touchdown value-analysis · QB / RB / WR / TE only · Research mode")
 st.warning("This is an early research prototype, not a live betting feed or a proven profitable model. Predictions are disabled until sufficient historical data is loaded and tested.")
 
 with st.sidebar:
@@ -481,7 +540,7 @@ with odds_tab:
             st.dataframe(best[display_cols], use_container_width=True)
         st.divider()
         st.subheader("Experimental anytime-TD probability & expected value")
-        st.caption("This fits a simple logistic model on loaded historical player usage. Estimates are research-only, not calibrated or proven profitable. First-TD, 2+ TD, rushing-TD and receiving-TD probabilities are not calculated by this model.")
+        st.caption("This fits a simple logistic model on QB/RB/WR/TE historical usage. Live odds estimates remain UNCALIBRATED and research-only, not proven profitable. First-TD, 2+ TD, rushing-TD and receiving-TD probabilities are not calculated by this model.")
         stats_for_value = st.session_state.stats_df
         if stats_for_value is None:
             st.info("Download historical player stats in the sidebar before calculating estimates.")
@@ -517,7 +576,7 @@ with odds_tab:
 
 with model_tab:
     st.subheader("Walk-forward anytime-TD model validation")
-    st.write("Each test season is predicted using only earlier seasons. Position-specific models are used where enough training examples exist; otherwise a global fallback is used. No historical betting odds are available, so this tests probability quality, **not betting ROI**.")
+    st.write("Only QB, RB, WR and TE player-games are included. Base models train on earlier seasons; Platt calibration uses **earlier seasons’ out-of-sample predictions only**. A season without enough earlier calibration data remains uncalibrated. No historical bookmaker odds are available, so this tests probability quality, **not realised betting ROI**.")
     stats = st.session_state.stats_df
     if stats is None:
         st.info("Download historical NFL player stats first (ideally 2018–2026).")
@@ -542,11 +601,31 @@ with model_tab:
             st.subheader("Results by test season")
             st.dataframe(report.round(4), use_container_width=True, hide_index=True)
             st.download_button("Download season validation report", report.to_csv(index=False).encode(), "td_edge_validation_by_season.csv", "text/csv")
+            st.subheader("Betting-relevant usage subset")
+            st.caption("A candidate must have at least two prior games and average at least 3 carries or 3 targets over the preceding four games. This uses only pre-game usage; it does not require a TD or a favourable model prediction. It is a proxy for plausible betting candidates, NOT verified bookmaker availability.")
+            relevant = preds[preds["betting_relevant"]].copy()
+            if not relevant.empty:
+                st.write(f"{len(relevant):,} of {len(preds):,} evaluated player-games pass the usage filter.")
+                summary = []
+                for pos, group in relevant.groupby("position"):
+                    summary.append({"position": pos, "rows": len(group),
+                        "brier_raw": brier_score_loss(group["target_any_td"], group["raw_probability"]),
+                        "brier_calibrated": brier_score_loss(group["target_any_td"], group["predicted_probability"]),
+                        "observed_td_pct": 100 * group["target_any_td"].mean(),
+                        "predicted_td_pct": 100 * group["predicted_probability"].mean()})
+                st.dataframe(pd.DataFrame(summary).round(4), hide_index=True, use_container_width=True)
+                relevant_calibration = _calibration_table(relevant, "predicted_probability", ["position"])
+                st.dataframe(relevant_calibration, hide_index=True, use_container_width=True)
+                st.download_button("Download betting-relevant calibration", relevant_calibration.to_csv(index=False).encode(), "td_edge_betting_relevant_calibration.csv", "text/csv")
             st.subheader("Probability calibration (all tested seasons)")
             st.caption("For well-calibrated probabilities, predicted % should be close to observed %. Small bands can be noisy; check sample counts.")
             st.dataframe(calibration, use_container_width=True, hide_index=True)
             st.line_chart(calibration.set_index("probability_band")[["predicted_pct", "observed_pct"]])
             st.download_button("Download calibration table", calibration.to_csv(index=False).encode(), "td_edge_calibration.csv", "text/csv")
+            st.subheader("Calibration by position")
+            position_calibration = _calibration_table(preds, "predicted_probability", ["position"])
+            st.dataframe(position_calibration, hide_index=True, use_container_width=True)
+            st.download_button("Download position calibration", position_calibration.to_csv(index=False).encode(), "td_edge_position_calibration.csv", "text/csv")
             st.subheader("By player position")
             pos_rows = []
             for pos, grp in preds.groupby("position"):
@@ -555,7 +634,7 @@ with model_tab:
                 pos_rows.append({"position": pos, "test_rows": len(grp), "brier": brier_score_loss(grp["target_any_td"], grp["predicted_probability"]), "observed_td_rate_pct": 100 * grp["target_any_td"].mean(), "mean_prediction_pct": 100 * grp["predicted_probability"].mean(), "position_model_pct": 100 * (grp["model_type"] == "position_specific").mean()})
             st.dataframe(pd.DataFrame(pos_rows).round(3), use_container_width=True, hide_index=True)
             st.download_button("Download out-of-sample predictions", preds.to_csv(index=False).encode(), "td_edge_validation_predictions.csv", "text/csv")
-    st.warning("This model does not yet include opponent strength, injury/news information, betting-market priors, or historical bookmaker odds. Backtest scores do not establish profitability.")
+    st.warning("The odds-scanner estimates are not yet calibrated; the validation tab evaluates a calibrated model separately. This model does not yet include opponent strength, injury/news information, betting-market priors, or historical bookmaker odds. Backtest scores do not establish profitability.")
     st.markdown("**Other markets:** first TD and 2+ TD are not modelled yet.")
 
 with guide_tab:
