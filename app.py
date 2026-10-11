@@ -401,6 +401,28 @@ def _calibration_table(preds: pd.DataFrame, probability_column: str, group_colum
     return result[result["n"] > 0].reset_index(drop=True)
 
 
+def select_models_from_prior_oos(prior: pd.DataFrame, min_rows: int = 300, min_seasons: int = 2, min_gain: float = 0.0001) -> dict:
+    """Choose defence per position using ONLY earlier held-out seasons.
+
+    Selection uses betting-relevant player-games and a conservative improvement
+    threshold. Never looks at the season being evaluated.
+    """
+    choices = {}
+    if prior.empty:
+        return {pos: "usage_only" for pos in ELIGIBLE_POSITIONS}
+    for pos in ELIGIBLE_POSITIONS:
+        group = prior[(prior["position"] == pos) & (prior["betting_relevant"])].copy()
+        if len(group) < min_rows or group["season"].nunique() < min_seasons:
+            choices[pos] = "usage_only"
+            continue
+        y = group["target_any_td"].to_numpy(dtype=float)
+        usage = group["usage_only_probability"].to_numpy(dtype=float)
+        defence = group["raw_probability"].to_numpy(dtype=float)
+        improvement = np.mean((usage - y) ** 2 - (defence - y) ** 2)
+        choices[pos] = "with_defense" if improvement > min_gain else "usage_only"
+    return choices
+
+
 def validate_position_models(stats: pd.DataFrame):
     """Chronological model and calibration tests on QB/RB/WR/TE only.
 
@@ -456,6 +478,18 @@ def validate_position_models(stats: pd.DataFrame):
             usage_pos.fit(pos_train[usage_features], pos_train["target_any_td"])
             test.loc[idx, "usage_only_probability"] = usage_pos.predict_proba(test.loc[idx, usage_features])[:, 1]
 
+        # Nested walk-forward selection: for this test season, choose each
+        # position's feature set using ONLY prior seasons' out-of-sample rows.
+        prior_for_selection = (pd.concat(predictions, ignore_index=True)
+                               if predictions else pd.DataFrame())
+        selection = select_models_from_prior_oos(prior_for_selection)
+        test["selected_model"] = test["position"].map(selection).fillna("usage_only")
+        test["selected_probability"] = np.where(
+            test["selected_model"].eq("with_defense"),
+            test["raw_probability"], test["usage_only_probability"])
+        test["selection_prior_seasons"] = (prior_for_selection["season"].nunique()
+                                            if not prior_for_selection.empty else 0)
+
         test["predicted_probability"] = test["raw_probability"]
         test["calibration_method"] = "uncalibrated_insufficient_prior_oos"
         if previous_oos:
@@ -495,10 +529,15 @@ def validate_position_models(stats: pd.DataFrame):
             "usage_only_brier": brier_score_loss(y, test["usage_only_probability"]),
             "usage_only_log_loss": log_loss(y, test["usage_only_probability"], labels=[0, 1]),
             "defense_minus_usage_brier": brier_score_loss(y, raw) - brier_score_loss(y, test["usage_only_probability"]),
+            "selected_brier": brier_score_loss(y, test["selected_probability"]),
+            "selected_log_loss": log_loss(y, test["selected_probability"], labels=[0, 1]),
+            "selection_prior_seasons": int(test["selection_prior_seasons"].iloc[0]),
         })
         relevant_test = test.loc[test["betting_relevant"]]
         if len(relevant_test):
             reports[-1].update({
+                "relevant_selected_brier": brier_score_loss(relevant_test["target_any_td"], relevant_test["selected_probability"]),
+                "relevant_selected_log_loss": log_loss(relevant_test["target_any_td"], relevant_test["selected_probability"], labels=[0, 1]),
                 "relevant_raw_brier": brier_score_loss(relevant_test["target_any_td"], relevant_test["raw_probability"]),
                 "relevant_usage_only_brier": brier_score_loss(relevant_test["target_any_td"], relevant_test["usage_only_probability"]),
                 "relevant_usage_only_log_loss": log_loss(relevant_test["target_any_td"], relevant_test["usage_only_probability"], labels=[0, 1]),
@@ -507,7 +546,7 @@ def validate_position_models(stats: pd.DataFrame):
                 "relevant_calibrated_log_loss": log_loss(relevant_test["target_any_td"], relevant_test["predicted_probability"], labels=[0, 1]),
             })
         previous_oos.append(test[["position", "target_any_td", "raw_probability"]].copy())
-        predictions.append(test[["season", "position", "target_any_td", "raw_probability", "usage_only_probability", "predicted_probability", "model_type", "calibration_method", "betting_relevant", "prior_games", "prior_carries_avg4", "prior_targets_avg4", "opponent_prior_td_allowed_avg4"]].copy())
+        predictions.append(test[["season", "position", "target_any_td", "raw_probability", "usage_only_probability", "selected_probability", "selected_model", "selection_prior_seasons", "predicted_probability", "model_type", "calibration_method", "betting_relevant", "prior_games", "prior_carries_avg4", "prior_targets_avg4", "opponent_prior_td_allowed_avg4"]].copy())
     if not reports:
         raise ValueError("Need multiple NFL seasons with enough QB/RB/WR/TE data (ideally 2018–2026).")
     report = pd.DataFrame(reports)
@@ -702,6 +741,31 @@ with model_tab:
             st.dataframe(ablation_df.round(5), use_container_width=True, hide_index=True)
             st.download_button("Download paired ablation comparison", ablation_df.to_csv(index=False).encode(), "td_edge_ablation_comparison.csv", "text/csv")
             st.download_button("Download paired season comparisons", report.to_csv(index=False).encode(), "td_edge_ablation_by_season.csv", "text/csv")
+            st.subheader("Nested walk-forward position selection")
+            st.caption("For each season, model choice is determined exclusively by earlier held-out seasons. It requires at least 300 betting-relevant prior player-games across two test seasons and a Brier improvement above 0.0001 to select defence; otherwise usage-only wins by default. This is an out-of-sample test of the selection RULE, not an untouched final holdout or evidence of profit.")
+            selection_rows = []
+            for subset_name, subset in [("All eligible", preds), ("Betting relevant", preds.loc[preds["betting_relevant"]])]:
+                for pos, grp in [("ALL", subset), *list(subset.groupby("position"))]:
+                    if grp.empty:
+                        continue
+                    selection_rows.append({
+                        "subset": subset_name, "position": pos, "rows": len(grp),
+                        "usage_brier": brier_score_loss(grp["target_any_td"], grp["usage_only_probability"]),
+                        "defense_brier": brier_score_loss(grp["target_any_td"], grp["raw_probability"]),
+                        "selected_brier": brier_score_loss(grp["target_any_td"], grp["selected_probability"]),
+                        "usage_log_loss": log_loss(grp["target_any_td"], grp["usage_only_probability"], labels=[0, 1]),
+                        "defense_log_loss": log_loss(grp["target_any_td"], grp["raw_probability"], labels=[0, 1]),
+                        "selected_log_loss": log_loss(grp["target_any_td"], grp["selected_probability"], labels=[0, 1]),
+                    })
+            selection_df = pd.DataFrame(selection_rows)
+            st.dataframe(selection_df.round(6), hide_index=True, use_container_width=True)
+            st.download_button("Download nested model comparison", selection_df.to_csv(index=False).encode(), "td_edge_nested_model_comparison.csv", "text/csv")
+            decision_df = (preds.groupby(["season", "position", "selected_model"], as_index=False)
+                           .agg(rows=("target_any_td", "size"), prior_oos_seasons=("selection_prior_seasons", "first")))
+            st.dataframe(decision_df, hide_index=True, use_container_width=True)
+            st.download_button("Download model selection decisions", decision_df.to_csv(index=False).encode(), "td_edge_model_selection_decisions.csv", "text/csv")
+            st.download_button("Download nested season scores", report.to_csv(index=False).encode(), "td_edge_nested_by_season.csv", "text/csv")
+            st.info("The live odds scanner still uses the defence-inclusive raw model. The nested selector is being tested here first; it has not been promoted to live estimates. Historical pre-game odds are required for ROI testing.")
             st.subheader("Betting-relevant usage subset")
             st.caption("A candidate must have at least two prior games and average at least 3 carries or 3 targets over the preceding four games. This uses only pre-game usage; it does not require a TD or a favourable model prediction. It is a proxy for plausible betting candidates, NOT verified bookmaker availability.")
             relevant = preds[preds["betting_relevant"]].copy()
