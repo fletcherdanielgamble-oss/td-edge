@@ -576,6 +576,13 @@ with odds_tab:
 
 with model_tab:
     st.subheader("Walk-forward anytime-TD model validation")
+    # Drop validation data retained from older app versions with different schemas.
+    if "validation_results" in st.session_state:
+        old = st.session_state.validation_results
+        required = {"betting_relevant", "raw_probability", "predicted_probability", "position", "target_any_td", "model_type"}
+        if not isinstance(old, tuple) or len(old) != 3 or not isinstance(old[2], pd.DataFrame) or not required.issubset(old[2].columns):
+            del st.session_state["validation_results"]
+            st.info("Previous-version validation results were cleared. Run chronological validation again.")
     st.write("Only QB, RB, WR and TE player-games are included. Base models train on earlier seasons; Platt calibration uses **earlier seasons’ out-of-sample predictions only**. A season without enough earlier calibration data remains uncalibrated. No historical bookmaker odds are available, so this tests probability quality, **not realised betting ROI**.")
     stats = st.session_state.stats_df
     if stats is None:
