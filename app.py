@@ -20,9 +20,61 @@ def to_pandas(obj):
 
 
 def load_nfl_stats(seasons: list[int]) -> pd.DataFrame:
+    """Load weekly player stats and attach real game dates from NFL schedules.
+
+    nflreadpy's weekly player-stat table does not consistently expose a usable
+    game_date column. We therefore enrich it from the schedule data, preferring
+    game_id joins and falling back to season/week/team joins.
+    """
     import nflreadpy as nfl
-    raw = nfl.load_player_stats(seasons=seasons, summary_level="week")
-    return to_pandas(raw)
+    stats = to_pandas(nfl.load_player_stats(seasons=seasons, summary_level="week"))
+
+    # If the stats already contain usable dates, preserve them.
+    date_col = next((c for c in ["game_date", "gameday", "game_date_dt"] if c in stats.columns), None)
+    if date_col is not None and pd.to_datetime(stats[date_col], errors="coerce").notna().sum() >= 100:
+        stats["game_date"] = pd.to_datetime(stats[date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+        return stats
+
+    schedules = to_pandas(nfl.load_schedules(seasons=seasons))
+    schedule_date_col = next((c for c in ["gameday", "game_date", "date"] if c in schedules.columns), None)
+    if schedule_date_col is None:
+        raise ValueError("NFL schedule data did not include a recognised game date column.")
+    schedules["game_date"] = pd.to_datetime(schedules[schedule_date_col], errors="coerce").dt.strftime("%Y-%m-%d")
+
+    # First choice: stable game ID, if both datasets expose it.
+    if "game_id" in stats.columns and "game_id" in schedules.columns:
+        date_map = schedules[["game_id", "game_date"]].dropna(subset=["game_id"]).drop_duplicates("game_id")
+        stats = stats.drop(columns=["game_date"], errors="ignore").merge(date_map, on="game_id", how="left")
+
+    # Fallback: weekly stats commonly identify team/season/week rather than game_id.
+    if "game_date" not in stats.columns or pd.to_datetime(stats["game_date"], errors="coerce").notna().sum() < 100:
+        team_col = next((c for c in ["recent_team", "team"] if c in stats.columns), None)
+        required = {"season", "week", "home_team", "away_team", "season", "week", "game_date"}
+        if team_col and {"season", "week", "home_team", "away_team", "game_date"}.issubset(schedules.columns):
+            home = schedules[["season", "week", "home_team", "game_date"]].rename(columns={"home_team": "_join_team"})
+            away = schedules[["season", "week", "away_team", "game_date"]].rename(columns={"away_team": "_join_team"})
+            schedule_teams = pd.concat([home, away], ignore_index=True).dropna(subset=["_join_team", "game_date"])
+            if "season_type" in stats.columns and "season_type" in schedules.columns:
+                # Retain season_type when available to avoid mixing preseason/regular/postseason weeks.
+                home = schedules[["season", "week", "season_type", "home_team", "game_date"]].rename(columns={"home_team": "_join_team"})
+                away = schedules[["season", "week", "season_type", "away_team", "game_date"]].rename(columns={"away_team": "_join_team"})
+                schedule_teams = pd.concat([home, away], ignore_index=True).dropna(subset=["_join_team", "game_date"])
+                join_cols = ["season", "week", "season_type"]
+            else:
+                join_cols = ["season", "week"]
+            schedule_teams = schedule_teams.drop_duplicates(join_cols + ["_join_team", "game_date"])
+            stats = stats.drop(columns=["game_date"], errors="ignore").merge(
+                schedule_teams,
+                left_on=join_cols + [team_col],
+                right_on=join_cols + ["_join_team"],
+                how="left",
+            ).drop(columns=["_join_team"], errors="ignore")
+
+    valid_dates = pd.to_datetime(stats.get("game_date"), errors="coerce") if "game_date" in stats.columns else pd.Series(dtype="datetime64[ns]")
+    if valid_dates.notna().sum() < 100:
+        raise ValueError("Could not match enough player stats to real NFL game dates. Reload the data; the schedule join did not find dates for enough rows.")
+    stats["game_date"] = valid_dates.dt.strftime("%Y-%m-%d")
+    return stats
 
 
 def clean_odds(df: pd.DataFrame) -> pd.DataFrame:
@@ -120,7 +172,8 @@ def build_player_game_features(stats: pd.DataFrame) -> pd.DataFrame:
     opp_col = find("opponent_team", "opponent")
     df["team"] = df[team_col].astype(str) if team_col else ""
     df["opponent"] = df[opp_col].astype(str) if opp_col else ""
-    df["game_date"] = df[find("game_date")].astype(str) if find("game_date") else ""
+    date_col = find("game_date", "gameday", "game_date_dt")
+    df["game_date"] = df[date_col].astype(str) if date_col else ""
     return df
 
 
