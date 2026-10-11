@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import requests
 from datetime import datetime, timezone
 
 import numpy as np
@@ -77,6 +78,135 @@ def load_nfl_stats(seasons: list[int]) -> pd.DataFrame:
         raise ValueError("Could not match enough player stats to real NFL game dates. Reload the data; the schedule join did not find dates for enough rows.")
     stats["game_date"] = valid_dates.dt.strftime("%Y-%m-%d")
     return stats
+
+
+# Live feed: The Odds API v4. The key is entered at runtime or stored in
+# Streamlit secrets as ODDS_API_KEY; never committed to GitHub.
+NFL_TEAMS = {
+    "Arizona Cardinals":"ARI", "Atlanta Falcons":"ATL", "Baltimore Ravens":"BAL",
+    "Buffalo Bills":"BUF", "Carolina Panthers":"CAR", "Chicago Bears":"CHI",
+    "Cincinnati Bengals":"CIN", "Cleveland Browns":"CLE", "Dallas Cowboys":"DAL",
+    "Denver Broncos":"DEN", "Detroit Lions":"DET", "Green Bay Packers":"GB",
+    "Houston Texans":"HOU", "Indianapolis Colts":"IND", "Jacksonville Jaguars":"JAX",
+    "Kansas City Chiefs":"KC", "Las Vegas Raiders":"LV", "Los Angeles Chargers":"LAC",
+    "Los Angeles Rams":"LA", "Miami Dolphins":"MIA", "Minnesota Vikings":"MIN",
+    "New England Patriots":"NE", "New Orleans Saints":"NO", "New York Giants":"NYG",
+    "New York Jets":"NYJ", "Philadelphia Eagles":"PHI", "Pittsburgh Steelers":"PIT",
+    "San Francisco 49ers":"SF", "Seattle Seahawks":"SEA", "Tampa Bay Buccaneers":"TB",
+    "Tennessee Titans":"TEN", "Washington Commanders":"WAS",
+}
+
+def odds_api_get(path: str, api_key: str, **params):
+    response = requests.get(
+        "https://api.the-odds-api.com/v4/sports/americanfootball_nfl" + path,
+        params={"apiKey": api_key, **params}, timeout=25,
+    )
+    if not response.ok:
+        raise ValueError(f"Odds provider HTTP {response.status_code}: {response.text[:240]}")
+    return response.json(), response.headers.get("x-requests-remaining", "unknown")
+
+
+def get_upcoming_games(api_key: str):
+    data, remaining = odds_api_get("/events", api_key, dateFormat="iso")
+    now = pd.Timestamp.now(tz="UTC")
+    games = [g for g in data if pd.to_datetime(g.get("commence_time"), utc=True, errors="coerce") > now]
+    return sorted(games, key=lambda g: g["commence_time"]), remaining
+
+
+def get_event_anytime_odds(api_key: str, games: list, region: str, stats: pd.DataFrame):
+    """Download supported player_anytime_td YES prices, with strict matchup mapping."""
+    if stats is None or stats.empty:
+        raise ValueError("Download NFL player stats first to match players to teams.")
+    frame = build_player_game_features(stats)
+    latest = frame.sort_values(["season", "week"]).drop_duplicates("player", keep="last")
+    team_by_player = dict(zip(latest["player"].map(normalize_player_name), latest["team"]))
+    rows, remaining = [], "unknown"
+    for game in games:
+        data, remaining = odds_api_get(
+            "/events/" + str(game["id"]) + "/odds", api_key,
+            regions=region, markets="player_anytime_td", oddsFormat="decimal", dateFormat="iso",
+        )
+        home, away = NFL_TEAMS.get(game.get("home_team")), NFL_TEAMS.get(game.get("away_team"))
+        if not home or not away:
+            continue
+        for book in data.get("bookmakers", []):
+            for market in book.get("markets", []):
+                if market.get("key") != "player_anytime_td":
+                    continue
+                for outcome in market.get("outcomes", []):
+                    # This market can contain Yes/No outcomes. Never use No prices as Yes.
+                    if str(outcome.get("name", "")).strip().lower() not in ("yes",):
+                        continue
+                    player = str(outcome.get("description", "")).strip()
+                    team = team_by_player.get(normalize_player_name(player))
+                    if not player or team not in (home, away):
+                        continue
+                    price = outcome.get("price")
+                    if not isinstance(price, (int, float)) or price <= 1:
+                        continue
+                    rows.append({
+                        "game_date": str(game["commence_time"])[:10],
+                        "game_id": game["id"], "player": player, "team": team,
+                        "opponent": away if team == home else home,
+                        "market": "Anytime TD", "bookmaker": book.get("title", book.get("key", "")),
+                        "decimal_odds": float(price),
+                        "captured_at_utc": market.get("last_update") or book.get("last_update") or datetime.now(timezone.utc).isoformat(),
+                        "matchup": f'{game.get("away_team")} @ {game.get("home_team")}',
+                        "commence_time": game["commence_time"],
+                    })
+    return clean_odds(pd.DataFrame(rows)), remaining
+
+
+def best_event_prices(odds: pd.DataFrame):
+    if odds.empty:
+        return odds.copy()
+    work = odds[odds["market"].eq("Anytime TD")].copy()
+    work["decimal_odds"] = pd.to_numeric(work["decimal_odds"], errors="coerce")
+    work = work.dropna(subset=["decimal_odds"])
+    if work.empty:
+        return work
+    keys = ["game_id", "player", "market"]
+    return work.loc[work.groupby(keys, dropna=False)["decimal_odds"].idxmax()].reset_index(drop=True)
+
+
+def historical_odds_backtest(odds: pd.DataFrame, predictions: pd.DataFrame):
+    """Evaluate only historical pre-kickoff odds with genuine held-out probabilities.
+
+    Requires a predictions export with player, game_date, predicted_probability,
+    target_any_td, and optionally game_id. No current-season refit on settled games.
+    """
+    required = {"player", "game_date", "predicted_probability", "target_any_td"}
+    if not required.issubset(predictions.columns):
+        raise ValueError("Predictions CSV must include player, game_date, predicted_probability, target_any_td. Historical validation export may need regenerating.")
+    prices = odds.copy()
+    for field in ("player", "game_date", "captured_at_utc", "decimal_odds"):
+        if field not in prices.columns:
+            raise ValueError(f"Historical odds CSV is missing {field}")
+    if "commence_time" not in prices.columns:
+        raise ValueError("Historical odds must include commence_time in UTC to verify pre-kickoff pricing.")
+    prices["quote_dt"] = pd.to_datetime(prices["captured_at_utc"], utc=True, errors="coerce")
+    prices["kickoff_dt"] = pd.to_datetime(prices["commence_time"], utc=True, errors="coerce")
+    prices = prices[prices["quote_dt"].notna() & prices["kickoff_dt"].notna() & (prices["quote_dt"] < prices["kickoff_dt"])].copy()
+    prices = prices[prices["market"].eq("Anytime TD")].copy()
+    prices["player_key"] = prices["player"].map(normalize_player_name)
+    preds = predictions.copy()
+    preds["player_key"] = preds["player"].map(normalize_player_name)
+    preds["game_date"] = pd.to_datetime(preds["game_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    prices["game_date"] = pd.to_datetime(prices["game_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    keys = ["game_date", "player_key"]
+    if "game_id" in preds.columns and "game_id" in prices.columns and preds["game_id"].notna().any():
+        keys.append("game_id")
+    preds = preds.drop_duplicates(keys)
+    merged = prices.merge(preds[keys + ["predicted_probability", "target_any_td"]], on=keys, how="inner")
+    if merged.empty:
+        return merged
+    merged = merged.loc[merged.groupby(keys)["decimal_odds"].idxmax()].copy()
+    merged["predicted_probability"] = pd.to_numeric(merged["predicted_probability"], errors="coerce")
+    merged["target_any_td"] = pd.to_numeric(merged["target_any_td"], errors="coerce")
+    merged = merged[merged["predicted_probability"].between(0, 1) & merged["target_any_td"].isin([0, 1])]
+    merged["expected_roi_pct"] = 100 * (merged["predicted_probability"] * merged["decimal_odds"] - 1)
+    merged["unit_profit"] = np.where(merged["target_any_td"].eq(1), merged["decimal_odds"] - 1, -1)
+    return merged
 
 
 def clean_odds(df: pd.DataFrame) -> pd.DataFrame:
@@ -546,7 +676,7 @@ def validate_position_models(stats: pd.DataFrame):
                 "relevant_calibrated_log_loss": log_loss(relevant_test["target_any_td"], relevant_test["predicted_probability"], labels=[0, 1]),
             })
         previous_oos.append(test[["position", "target_any_td", "raw_probability"]].copy())
-        predictions.append(test[["season", "position", "target_any_td", "raw_probability", "usage_only_probability", "selected_probability", "selected_model", "selection_prior_seasons", "predicted_probability", "model_type", "calibration_method", "betting_relevant", "prior_games", "prior_carries_avg4", "prior_targets_avg4", "opponent_prior_td_allowed_avg4"]].copy())
+        predictions.append(test[["player", "game_date", "season", "position", "target_any_td", "raw_probability", "usage_only_probability", "selected_probability", "selected_model", "selection_prior_seasons", "predicted_probability", "model_type", "calibration_method", "betting_relevant", "prior_games", "prior_carries_avg4", "prior_targets_avg4", "opponent_prior_td_allowed_avg4"]].copy())
     if not reports:
         raise ValueError("Need multiple NFL seasons with enough QB/RB/WR/TE data (ideally 2018–2026).")
     report = pd.DataFrame(reports)
@@ -580,7 +710,7 @@ if load_btn:
         st.error(f"Could not download data: {exc}")
         st.info("You can still use the upload controls below. Check your internet connection and the nflreadpy installation if downloading fails.")
 
-stats_tab, odds_tab, model_tab, guide_tab = st.tabs(["Overview", "Odds scanner", "Model & backtest", "Setup guide"])
+stats_tab, upcoming_tab, odds_tab, model_tab, historical_tab, guide_tab = st.tabs(["Overview", "Upcoming games & top EV", "Odds scanner", "Model & backtest", "Historical odds ROI", "Setup guide"])
 
 with stats_tab:
     stats = st.session_state.stats_df
@@ -599,6 +729,83 @@ with stats_tab:
         c3.metric("Columns", f"{len(stats.columns):,}")
         st.dataframe(stats.head(30), use_container_width=True)
         st.download_button("Download loaded stats as CSV", stats.to_csv(index=False).encode(), "nfl_player_stats.csv", "text/csv")
+
+with upcoming_tab:
+    st.subheader("Next NFL games — top 3 estimated EV selections per game")
+    st.caption("Prices are fetched on demand. Rankings are experimental anytime-TD estimates, not proven betting edges. Times shown in Melbourne/Sydney AEDT/AEST.")
+    try:
+        secret_key = st.secrets.get("ODDS_API_KEY", "")
+    except Exception:
+        secret_key = ""
+    entered_key = st.text_input("The Odds API key (or set ODDS_API_KEY in Streamlit secrets)", type="password", value=secret_key)
+    region = st.selectbox("Bookmaker region", ["au", "us", "uk", "eu"], index=0)
+    if st.button("Load upcoming NFL games", key="load_upcoming"):
+        if not entered_key:
+            st.error("Enter an API key to fetch upcoming games.")
+        else:
+            try:
+                games, remaining = get_upcoming_games(entered_key)
+                st.session_state.upcoming_games = games
+                st.session_state.upcoming_region = region
+                st.info(f"Loaded {len(games)} upcoming games. API credits remaining: {remaining}.")
+            except Exception as exc:
+                st.error(f"Unable to fetch games: {exc}")
+    games = st.session_state.get("upcoming_games", [])
+    if games:
+        max_games = st.number_input("Games to fetch anytime-TD odds for (each event uses API credits)", min_value=1, max_value=len(games), value=min(4, len(games)), step=1)
+        st.write("Upcoming matchups:")
+        for g in games:
+            local = pd.to_datetime(g["commence_time"], utc=True).tz_convert("Australia/Melbourne")
+            st.write(f'**{g["away_team"]} @ {g["home_team"]}** — {local:%a %d %b, %I:%M %p} Melbourne')
+        if st.button("Fetch live player odds & calculate EV", type="primary", key="fetch_live"):
+            if not entered_key:
+                st.error("Enter your API key first.")
+            elif st.session_state.stats_df is None:
+                st.error("Download historical NFL player stats in the sidebar first.")
+            else:
+                try:
+                    with st.spinner("Fetching player odds and fitting date-restricted model…"):
+                        live, remaining = get_event_anytime_odds(entered_key, games[:int(max_games)], region, st.session_state.stats_df)
+                        best = best_event_prices(live)
+                        if best.empty:
+                            st.session_state.live_estimates = pd.DataFrame()
+                        else:
+                            scored, _ = estimate_anytime_td_value(st.session_state.stats_df, best)
+                            st.session_state.live_estimates = scored
+                        st.session_state.live_fetch_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
+                    st.success(f"Fetched odds. API credits remaining: {remaining}.")
+                except Exception as exc:
+                    st.error(f"Unable to calculate live EV: {exc}")
+        if "live_estimates" in st.session_state:
+            estimates = st.session_state.live_estimates
+            st.caption(f'Last refreshed (UTC): {st.session_state.get("live_fetch_time", "unknown")}. Prices may have changed.')
+            edge_cutoff = st.slider("Minimum model edge (percentage points)", 0.0, 25.0, 5.0, 0.5, key="upcoming_edge")
+            min_games = st.number_input("Minimum player games of history", 1, 16, 4, key="upcoming_history")
+            if estimates.empty:
+                st.warning("No matching anytime-TD YES prices were returned. The market may not be listed yet for this region or these games.")
+            else:
+                for g in games[:int(max_games)]:
+                    local = pd.to_datetime(g["commence_time"], utc=True).tz_convert("Australia/Melbourne")
+                    st.markdown(f'#### {g["away_team"]} @ {g["home_team"]} — {local:%a %d %b, %I:%M %p}')
+                    group = estimates[estimates["game_id"].eq(g["id"])].copy()
+                    if group.empty:
+                        st.info("No matched anytime-TD prices for this game.")
+                        continue
+                    eligible = group[
+                        group["model_probability"].notna()
+                        & group["model_position_group"].isin(ELIGIBLE_POSITIONS)
+                        & group["model_prior_games"].ge(min_games)
+                        & group["edge_percentage_points"].ge(edge_cutoff)
+                        & group["model_defense_history_available"].eq(True)
+                    ].sort_values("expected_roi_pct", ascending=False).head(3)
+                    if eligible.empty:
+                        st.info("No selections meet the model-history and edge thresholds. No picks forced.")
+                    else:
+                        columns = ["player", "model_position_group", "bookmaker", "decimal_odds", "model_probability_pct", "raw_implied_probability_pct", "edge_percentage_points", "expected_roi_pct"]
+                        st.dataframe(eligible[columns].rename(columns={"model_position_group":"position", "decimal_odds":"best_odds"}), hide_index=True, use_container_width=True)
+                st.download_button("Download live EV estimates", estimates.to_csv(index=False), "td_edge_live_ev.csv", "text/csv")
+    else:
+        st.info("Enter your API key and load upcoming NFL games to begin.")
 
 with odds_tab:
     st.subheader("Import bookmaker odds")
@@ -816,6 +1023,34 @@ with model_tab:
             st.download_button("Download out-of-sample predictions", preds.to_csv(index=False).encode(), "td_edge_validation_predictions.csv", "text/csv")
     st.warning("The odds-scanner estimates are not yet calibrated; the validation tab evaluates a calibrated model separately. This model includes a limited lagged opponent TD-allowance proxy, but not injury/news information, red-zone opportunities, playing-time snaps, betting-market priors, or historical bookmaker odds. Backtest scores do not establish profitability.")
     st.markdown("**Other markets:** first TD and 2+ TD are not modelled yet.")
+
+with historical_tab:
+    st.subheader("Historical pre-game bookmaker odds — ROI research")
+    st.write("Upload genuine historical pre-kickoff odds and out-of-sample predictions. The app will never treat today's live odds as historical prices.")
+    st.caption("Required odds columns: player, game_date, market, decimal_odds, captured_at_utc, commence_time (both timestamps UTC); optionally game_id. Predictions must include player, game_date, predicted_probability, target_any_td; optionally game_id.")
+    hist_prices = st.file_uploader("Historical bookmaker odds CSV", type=["csv"], key="historical_prices")
+    hist_preds = st.file_uploader("Historical out-of-sample predictions CSV", type=["csv"], key="historical_predictions")
+    if hist_prices is not None and hist_preds is not None:
+        try:
+            hist_result = historical_odds_backtest(pd.read_csv(hist_prices), pd.read_csv(hist_preds))
+            if hist_result.empty:
+                st.warning("No valid matching pre-kickoff bets. Check player names, event dates and UTC timestamps.")
+            else:
+                min_edge = st.slider("Historical minimum estimated edge (pp)", 0.0, 25.0, 5.0, 0.5, key="historical_edge")
+                tested = hist_result[hist_result["expected_roi_pct"].ge(min_edge)].copy()
+                if tested.empty:
+                    st.info("No historical selections meet this edge threshold.")
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("Selections", f"{len(tested):,}")
+                    c2.metric("Flat-stake ROI", f'{100 * tested["unit_profit"].mean():.2f}%')
+                    c3.metric("Units won/lost", f'{tested["unit_profit"].sum():.2f}')
+                    st.dataframe(tested, use_container_width=True)
+                    st.download_button("Download settled historical bets", tested.to_csv(index=False), "td_edge_historical_roi.csv", "text/csv")
+                st.warning("Selecting thresholds after inspecting results creates selection bias. Reserve a future holdout for genuine testing.")
+        except Exception as exc:
+            st.error(f"Historical backtest couldn't run: {exc}")
+    st.caption("The Odds API offers paid historical player-prop snapshots. You can also use your own archived pre-game quotes with reliable timestamps.")
 
 with guide_tab:
     st.subheader("What happens next")
